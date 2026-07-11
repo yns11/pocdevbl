@@ -1,2 +1,5 @@
 streamlit
 pillow
+pandas
+databricks-sql-connector
+databricks-sdk
