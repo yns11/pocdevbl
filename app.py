@@ -6,6 +6,7 @@ import pandas as pd
 from PIL import Image
 from databricks import sql
 from databricks.sdk.core import Config
+from databricks.sdk import WorkspaceClient
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="Dématérialisation BL", layout="wide", page_icon="📋")
@@ -119,12 +120,19 @@ with tab_ajout:
                     chemin_complet_volume = os.path.join(PATH_VOLUME, nom_fichier)
                     
                     try:
-                        # Force la création du dossier du Volume si Databricks Apps ne l'a pas pré-créé
-                        os.makedirs(os.path.dirname(chemin_complet_volume), exist_ok=True)
+                        # Initialisation du client Workspace (utilise le token de l'App automatiquement)
+                        w = WorkspaceClient()
                         
-                        # Écriture POSIX native dans le Volume cloud
-                        with open(chemin_complet_volume, "wb") as f:
-                            f.write(img_bytes)
+                        # Définition du chemin d'accès cloud pour Unity Catalog
+                        id_photo_unique = str(uuid.uuid4())
+                        nom_fichier = f"{id_bl_unique}_{idx}_{id_photo_unique}.jpg"
+                        
+                        # Le chemin UC officiel n'utilise pas le dossier racine local /Volumes
+                        chemin_unity_catalog = f"/Volumes/poc_bl/projet_livraison/images_bl/{nom_fichier}"
+                        
+                        # Téléversement direct et sécurisé via l'API de Databricks (plus de conflit de droits Linux !)
+                        with w.files.upload(chemin_unity_catalog, img_bytes) as response:
+                            pass
                             
                         # Insertion du lien dans la table secondaire
                         query_photo = f"""
@@ -134,10 +142,11 @@ with tab_ajout:
                         execute_sql_query(query_photo, params={
                             "id_p": id_photo_unique, 
                             "id_b": id_bl_unique, 
-                            "path": chemin_complet_volume
+                            "path": chemin_unity_catalog
                         })
+                        
                     except Exception as e:
-                        st.error(f"Erreur d'écriture du fichier photo {idx+1} : {e}")
+                        st.error(f"Erreur de transfert de la photo {idx+1} vers le Volume UC : {e}")
                         sauvegarde_reussie = False
                 
                 # 2. Insertion des métadonnées textuelles dans la table principale
