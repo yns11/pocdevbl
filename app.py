@@ -119,6 +119,9 @@ with tab_ajout:
                     chemin_complet_volume = os.path.join(PATH_VOLUME, nom_fichier)
                     
                     try:
+                        # Force la création du dossier du Volume si Databricks Apps ne l'a pas pré-créé
+                        os.makedirs(os.path.dirname(chemin_complet_volume), exist_ok=True)
+                        
                         # Écriture POSIX native dans le Volume cloud
                         with open(chemin_complet_volume, "wb") as f:
                             f.write(img_bytes)
