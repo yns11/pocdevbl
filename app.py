@@ -3,6 +3,8 @@ import datetime
 import uuid
 import os
 from PIL import Image
+
+
 from databricks.connect import DatabricksSession
 
 # --- CONFIGURATION DE LA PAGE ---
