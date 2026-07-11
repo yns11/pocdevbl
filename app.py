@@ -2,31 +2,63 @@ import streamlit as st
 import datetime
 import uuid
 import os
+import pandas as pd
 from PIL import Image
-
-
-from databricks.connect import DatabricksSession
+from databricks import sql
+from databricks.sdk.core import Config
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="Dématérialisation BL", layout="wide", page_icon="📋")
 
-st.title("📋 Dématérialisation BL — Connexion Databricks Delta")
+st.title("📋 Dématérialisation BL — Connexion Databricks SQL")
+st.write("Version de production optimisée pour Databricks Apps (sans dépendance Java).")
 
-# --- INITIALISATION DE LA SESSION DATABRICKS ---
+# --- INITIALISATION DE LA CONFIGURATION DATABRICKS ---
 @st.cache_resource
-def get_spark_session():
-    # Récupère automatiquement le contexte sécurisé de l'utilisateur connecté sur Databricks
-    return DatabricksSession.builder.getOrCreate()
+def get_databricks_config():
+    # Récupère automatiquement le contexte et le token de l'utilisateur connecté sur Databricks Apps
+    return Config()
 
-spark = get_spark_session()
+try:
+    cfg = get_databricks_config()
+    server_hostname = cfg.host.replace("https://", "")
+except Exception as e:
+    st.error(f"Erreur d'initialisation du contexte Databricks : {e}")
+    server_hostname = None
 
 # --- CONFIGURATION DES CHEMINS (Unity Catalog) ---
 CATALOG_SCHEMA = "poc_bl.projet_livraison"
-# Chemin d'accès au volume sous l'architecture POSIX de Databricks
 PATH_VOLUME = "/Volumes/poc_bl/projet_livraison/images_bl/"
 
-# On garde le session_state UNIQUEMENT pour stocker les photos temporairement 
-# le temps que l'utilisateur clique sur "Ajouter" avant la sauvegarde finale.
+# --- FONCTION UTILITAIRE EXÉCUTION SQL ---
+def execute_sql_query(query, params=None):
+    """Exécute une requête SQL de manière sécurisée via le Databricks SQL Connector"""
+    if not server_hostname:
+        st.error("Hôte Databricks introuvable. Vérifiez que l'application s'exécute dans Databricks Apps.")
+        return pd.DataFrame()
+        
+    # Databricks Apps injecte automatiquement le chemin HTTP du Warehouse par défaut dans l'environnement,
+    # sinon vous pouvez spécifier l'ID de votre SQL Warehouse manuellement.
+    http_path = os.environ.get("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/votre_id_warehouse")
+
+    try:
+        with sql.connect(
+            server_hostname=server_hostname,
+            http_path=http_path,
+            credentials_provider=lambda: cfg.credentials_provider
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+                if cursor.description:  # Si la requête retourne des lignes (SELECT)
+                    colnames = [desc[0] for desc in cursor.description]
+                    return pd.DataFrame(cursor.fetchall(), columns=colnames)
+                connection.commit()
+                return None
+    except Exception as error:
+        st.error(f"Erreur SQL : {error}")
+        return pd.DataFrame() if "SELECT" in query.upper() else None
+
+# --- MÉMOIRE TEMPORAIRE STREAMLIT ---
 if "photos_temporaires" not in st.session_state:
     st.session_state.photos_temporaires = []
 
@@ -34,7 +66,7 @@ if "photos_temporaires" not in st.session_state:
 tab_ajout, tab_recherche = st.tabs(["➕ Ajouter un BL", "🔍 Rechercher & Consulter"])
 
 # =====================================================================
-# ONGLET 1 : AJOUT ET ÉCRITURE DANS LES TABLES DELTA
+# ONGLET 1 : AJOUT ET ÉCRITURE DANS LE LAKEHOUSE
 # =====================================================================
 with tab_ajout:
     st.header("Saisie d'un nouveau Bordereau")
@@ -53,13 +85,12 @@ with tab_ajout:
     
     if photo_capturee:
         if st.button("➕ Ajouter cette photo au BL", use_container_width=True):
-            # On conserve le fichier brut (octets) en mémoire temporaire Streamlit
             st.session_state.photos_temporaires.append(photo_capturee.getvalue())
             st.toast("Photo ajoutée temporairement !", icon="✅")
             st.rerun()
 
     if st.session_state.photos_temporaires:
-        st.write(f"📂 **Photos prêtes à être sauvegardées sur Databricks ({len(st.session_state.photos_temporaires)}) :**")
+        st.write(f"📂 **Photos prêtes à être sauvegardées ({len(st.session_state.photos_temporaires)}) :**")
         cols_miniatures = st.columns(len(st.session_state.photos_temporaires))
         for idx, img_bytes in enumerate(st.session_state.photos_temporaires):
             with cols_miniatures[idx]:
@@ -78,41 +109,51 @@ with tab_ajout:
             st.error("Veuillez prendre au moins une photo.")
         else:
             with st.spinner("Écriture dans le Data Lakehouse en cours..."):
-                try:
-                    # 1. Générer un ID unique pour ce BL (Clé primaire)
-                    id_bl_unique = str(uuid.uuid4())
+                id_bl_unique = str(uuid.uuid4())
+                sauvegarde_reussie = True
+                
+                # 1. Sauvegarde des fichiers physiques dans le Volume Unity Catalog
+                for idx, img_bytes in enumerate(st.session_state.photos_temporaires):
+                    id_photo_unique = str(uuid.uuid4())
+                    nom_fichier = f"{id_bl_unique}_{idx}_{id_photo_unique}.jpg"
+                    chemin_complet_volume = os.path.join(PATH_VOLUME, nom_fichier)
                     
-                    # 2. Sauvegarder les fichiers physiques dans le Volume Unity Catalog
-                    for idx, img_bytes in enumerate(st.session_state.photos_temporaires):
-                        id_photo_unique = str(uuid.uuid4())
-                        nom_fichier = f"{id_bl_unique}_{idx}_{id_photo_unique}.jpg"
-                        chemin_complet_volume = os.path.join(PATH_VOLUME, nom_fichier)
-                        
-                        # Écriture physique sur le Volume cloud
+                    try:
+                        # Écriture POSIX native dans le Volume cloud
                         with open(chemin_complet_volume, "wb") as f:
                             f.write(img_bytes)
-                        
+                            
                         # Insertion du lien dans la table secondaire
                         query_photo = f"""
                             INSERT INTO {CATALOG_SCHEMA}.pieces_jointes_bl (id_photo, id_bl, chemin_stockage)
-                            VALUES ('{id_photo_unique}', '{id_bl_unique}', '{chemin_complet_volume}')
+                            VALUES (%(id_p)s, %(id_b)s, %(path)s)
                         """
-                        spark.sql(query_photo)
-                    
-                    # 3. Insertion des métadonnées textuelles dans la table principale
+                        execute_sql_query(query_photo, params={
+                            "id_p": id_photo_unique, 
+                            "id_b": id_bl_unique, 
+                            "path": chemin_complet_volume
+                        })
+                    except Exception as e:
+                        st.error(f"Erreur d'écriture du fichier photo {idx+1} : {e}")
+                        sauvegarde_reussie = False
+                
+                # 2. Insertion des métadonnées textuelles dans la table principale
+                if sauvegarde_reussie:
                     query_bl = f"""
                         INSERT INTO {CATALOG_SCHEMA}.suivi_bl (id_bl, numero_bl, nom_fournisseur, date_reception, date_saisie)
-                        VALUES ('{id_bl_unique}', '{num_bl}', '{nom_fournisseur}', '{date_reception}', current_timestamp())
+                        VALUES (%(id_b)s, %(num)s, %(fourn)s, %(date_r)s, CURRENT_TIMESTAMP())
                     """
-                    spark.sql(query_bl)
+                    execute_sql_query(query_bl, params={
+                        "id_b": id_bl_unique,
+                        "num": num_bl,
+                        "fourn": nom_fournisseur,
+                        "date_r": date_reception
+                    })
                     
                     # Libération de la mémoire
                     st.session_state.photos_temporaires = []
-                    st.success(f"BL n°{num_bl} sauvegardé de manière permanente dans Delta Lake !")
+                    st.success(f"BL n° {num_bl} sauvegardé avec succès dans Delta Lake !")
                     st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Erreur lors de la sauvegarde Databricks : {e}")
 
 # =====================================================================
 # ONGLET 2 : RECHERCHE ET LECTURE DEPUIS DELTA LAKE
@@ -120,23 +161,25 @@ with tab_ajout:
 with tab_recherche:
     st.header("Historique et Recherche")
     
-    # 1. Zone des filtres
     col_f1, col_f2 = st.columns(2)
     with col_f1:
         f_fournisseur = st.text_input("Filtrer par fournisseur")
     with col_f2:
         f_numero = st.text_input("Filtrer par numéro de BL")
         
-    # 2. Construction de la requête SQL dynamique avec filtres
-    conditions = ["1=1"] # Condition de base toujours vraie
+    # Construction de la clause WHERE sécurisée pour éviter les injections SQL
+    conditions = ["1=1"]
+    params_filtre = {}
+    
     if f_fournisseur:
-        conditions.append(f"lower(nom_fournisseur) LIKE '%{f_fournisseur.lower()}%'")
+        conditions.append("LOWER(nom_fournisseur) LIKE %(f_fourn)s")
+        params_filtre["f_fourn"] = f"%{f_fournisseur.lower()}%"
     if f_numero:
-        conditions.append(f"lower(numero_bl) LIKE '%{f_numero.lower()}%'")
+        conditions.append("LOWER(numero_bl) LIKE %(f_num)s")
+        params_filtre["f_num"] = f"%{f_numero.lower()}%"
         
     where_clause = " AND ".join(conditions)
     
-    # Requête pour récupérer les BL (limité aux 50 derniers pour la performance)
     query_select_bl = f"""
         SELECT id_bl, numero_bl, nom_fournisseur, date_reception 
         FROM {CATALOG_SCHEMA}.suivi_bl 
@@ -144,60 +187,57 @@ with tab_recherche:
         ORDER BY date_saisie DESC LIMIT 50
     """
     
-    try:
-        # Récupération sous forme de DataFrame Pandas pour Streamlit
-        df_bl = spark.sql(query_select_bl).toPandas()
+    df_bl = execute_sql_query(query_select_bl, params=params_filtre)
+    
+    if df_bl is None or df_bl.empty:
+        st.info("Aucun BL trouvé ou en attente de connexion Databricks.")
+    else:
+        st.write(f"Résultat : {len(df_bl)} BL trouvé(s)")
         
-        if df_bl.empty:
-            st.info("Aucun BL ne correspond à votre recherche.")
-        else:
-            st.write(f"Résultat : {len(df_bl)} BL trouvé(s)")
+        for index, row in df_bl.iterrows():
+            id_bl = row['id_bl']
             
-            for index, row in df_bl.iterrows():
-                id_bl = row['id_bl']
+            # Récupérer les photos rattachées
+            query_photos = f"SELECT chemin_stockage FROM {CATALOG_SCHEMA}.pieces_jointes_bl WHERE id_bl = %(id_b)s"
+            df_photos = execute_sql_query(query_photos, params={"id_b": id_bl})
+            nb_photos = len(df_photos) if df_photos is not None else 0
+            
+            with st.expander(f"📄 BL n° {row['numero_bl']} — {row['nom_fournisseur']} ({nb_photos} photo(s))"):
+                col_txt, col_imgs = st.columns([1, 1])
                 
-                # Récupérer les photos associées à CE BL spécifique
-                query_photos = f"SELECT chemin_stockage FROM {CATALOG_SCHEMA}.pieces_jointes_bl WHERE id_bl = '{id_bl}'"
-                df_photos = spark.sql(query_photos).toPandas()
-                nb_photos = len(df_photos)
-                
-                with st.expander(f"📄 BL n° {row['numero_bl']} — {row['nom_fournisseur']} ({nb_photos} photo(s))"):
-                    col_txt, col_imgs = st.columns([1, 1])
+                with col_txt:
+                    st.write(f"**Date de livraison :** {row['date_reception']}")
                     
-                    with col_txt:
-                        st.write(f"**Date de livraison :** {row['date_reception']}")
+                    nouveau_nom = st.text_input(
+                        f"Modifier le fournisseur pour le BL {row['numero_bl']}", 
+                        value=row['nom_fournisseur'], 
+                        key=f"edit_{id_bl}"
+                    )
+                    if nouveau_nom != row['nom_fournisseur']:
+                        query_update = f"""
+                            UPDATE {CATALOG_SCHEMA}.suivi_bl 
+                            SET nom_fournisseur = %(new_name)s 
+                            WHERE id_bl = %(id_b)s
+                        """
+                        execute_sql_query(query_update, params={"new_name": nouveau_nom, "id_b": id_bl})
+                        st.success("Base mise à jour !")
+                        st.rerun()
                         
-                        # Modification directe dans la table Delta
-                        nouveau_nom = st.text_input(
-                            f"Modifier le fournisseur pour le BL {row['numero_bl']}", 
-                            value=row['nom_fournisseur'], 
-                            key=f"edit_{id_bl}"
-                        )
-                        if nouveau_nom != row['nom_fournisseur']:
-                            query_update = f"""
-                                UPDATE {CATALOG_SCHEMA}.suivi_bl 
-                                SET nom_fournisseur = '{nouveau_nom}' 
-                                WHERE id_bl = '{id_bl}'
-                            """
-                            spark.sql(query_update)
-                            st.success("Mis à jour dans Delta Lake !")
-                            st.rerun()
-                            
-                    with col_imgs:
-                        if nb_photos > 0:
-                            # Affichage des photos lues depuis le Volume
-                            if nb_photos > 1:
-                                sub_tabs = st.tabs([f"Page {i+1}" for i in range(nb_photos)])
-                                for idx, path in enumerate(df_photos['chemin_stockage']):
-                                    with sub_tabs[idx]:
-                                        # Le volume est accessible directement en lecture Python
-                                        if os.path.exists(path):
-                                            st.image(path, use_container_width=True)
-                            else:
-                                single_path = df_photos['chemin_stockage'].iloc[0]
-                                if os.path.exists(single_path):
-                                    st.image(single_path, use_container_width=True)
+                with col_imgs:
+                    if nb_photos > 0:
+                        if nb_photos > 1:
+                            sub_tabs = st.tabs([f"Page {i+1}" for i in range(nb_photos)])
+                            for idx, path in enumerate(df_photos['chemin_stockage']):
+                                with sub_tabs[idx]:
+                                    if os.path.exists(path):
+                                        st.image(path, use_container_width=True)
+                                    else:
+                                        st.caption("Fichier introuvable sur le volume.")
                         else:
-                            st.warning("Aucune photo rattachée.")
-    except Exception as e:
-        st.error(f"Erreur de lecture de la base Databricks : {e}")
+                            single_path = df_photos['chemin_stockage'].iloc[0]
+                            if os.path.exists(single_path):
+                                st.image(single_path, use_container_width=True)
+                            else:
+                                st.caption("Fichier introuvable sur le volume.")
+                    else:
+                        st.warning("Aucune photo rattachée.")
