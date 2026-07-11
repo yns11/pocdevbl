@@ -52,9 +52,15 @@ def get_connection():
     if not server_hostname:
         raise RuntimeError("Hôte Databricks introuvable. Vérifiez que l'application s'exécute dans Databricks Apps.")
 
-    http_path = os.environ.get("DATABRICKS_HTTP_PATH")
-    if not http_path:
-        raise RuntimeError("Variable d'environnement DATABRICKS_HTTP_PATH manquante : impossible de joindre le SQL Warehouse.")
+    # Databricks Apps n'injecte pas de chemin HTTP automatiquement : il faut attacher un SQL Warehouse
+    # comme ressource de l'app (clé "sql-warehouse") et le référencer dans app.yaml, ce qui expose son ID.
+    warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID")
+    if not warehouse_id:
+        raise RuntimeError(
+            "DATABRICKS_WAREHOUSE_ID manquant : attachez un SQL Warehouse comme ressource de l'app "
+            "(Databricks Apps UI) et vérifiez que app.yaml le référence."
+        )
+    http_path = f"/sql/1.0/warehouses/{warehouse_id}"
 
     connection = sql.connect(
         server_hostname=server_hostname,
