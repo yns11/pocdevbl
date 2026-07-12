@@ -2,3 +2,4 @@ streamlit
 pillow
 pandas
 databricks-connect
+databricks-sdk
