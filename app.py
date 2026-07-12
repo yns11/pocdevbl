@@ -1,3 +1,4 @@
+import io
 import os
 import uuid
 import datetime
@@ -5,6 +6,7 @@ import datetime
 import streamlit as st
 import pandas as pd
 from databricks.connect import DatabricksSession
+from databricks.sdk import WorkspaceClient
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="Dématérialisation BL", layout="wide", page_icon="📋")
@@ -17,6 +19,13 @@ def get_spark_session():
     # .serverless() est nécessaire : sans cluster_id ni indication explicite,
     # Databricks Connect ne déduit pas tout seul qu'il doit utiliser le compute serverless.
     return DatabricksSession.builder.serverless().getOrCreate()
+
+
+@st.cache_resource
+def get_workspace_client() -> WorkspaceClient:
+    # Le conteneur de l'app n'a pas /Volumes monté localement (contrairement à un cluster) :
+    # la lecture/écriture des photos passe donc par l'API Files, pas par open()/os.path.
+    return WorkspaceClient()
 
 
 spark = get_spark_session()
@@ -41,8 +50,12 @@ def show_flash() -> None:
 
 
 def afficher_photo(chemin: str) -> None:
-    if os.path.exists(chemin):
-        st.image(chemin, use_container_width=True)
+    try:
+        w = get_workspace_client()
+        img_bytes = w.files.download(chemin).contents.read()
+        st.image(img_bytes, use_container_width=True)
+    except Exception:
+        st.caption("Fichier introuvable sur le volume.")
     else:
         st.caption("Fichier introuvable sur le volume.")
 
@@ -125,14 +138,14 @@ with tab_ajout:
                         },
                     )
 
+                    w = get_workspace_client()
                     for idx, img_bytes in enumerate(st.session_state.photos_temporaires):
                         id_photo_unique = str(uuid.uuid4())
                         nom_fichier = f"{id_bl_unique}_{idx}_{id_photo_unique}.jpg"
                         chemin_complet_volume = os.path.join(PATH_VOLUME, nom_fichier)
 
-                        # Écriture physique sur le Volume (monté localement via FUSE)
-                        with open(chemin_complet_volume, "wb") as f:
-                            f.write(img_bytes)
+                        # Écriture sur le Volume via l'API Files (pas d'accès /Volumes local dans l'app)
+                        w.files.upload(chemin_complet_volume, io.BytesIO(img_bytes), overwrite=True)
 
                         spark.sql(
                             f"""
