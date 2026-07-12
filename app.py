@@ -54,10 +54,8 @@ def afficher_photo(chemin: str) -> None:
         w = get_workspace_client()
         img_bytes = w.files.download(chemin).contents.read()
         st.image(img_bytes, use_container_width=True)
-    except Exception:
-        st.caption("Fichier introuvable sur le volume.")
-    else:
-        st.caption("Fichier introuvable sur le volume.")
+    except Exception as e:
+        st.caption(f"Fichier introuvable ou inaccessible sur le volume : {e}")
 
 
 # On garde le session_state UNIQUEMENT pour stocker les photos temporairement
