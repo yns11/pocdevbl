@@ -53,7 +53,9 @@ def afficher_photo(chemin: str) -> None:
     try:
         w = get_workspace_client()
         img_bytes = w.files.download(chemin).contents.read()
-        st.image(img_bytes, use_container_width=True)
+        # use_column_width (et non use_container_width) pour compatibilité avec la version
+        # de Streamlit du runtime Databricks Apps, plus ancienne.
+        st.image(img_bytes, use_column_width=True)
     except Exception as e:
         st.caption(f"Fichier introuvable ou inaccessible sur le volume : {e}")
 
