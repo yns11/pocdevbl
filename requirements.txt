@@ -3,3 +3,4 @@ pillow
 pandas
 databricks-connect
 databricks-sdk
+boto3
