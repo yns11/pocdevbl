@@ -14,8 +14,9 @@ st.title("📋 Dématérialisation BL — Connexion Databricks Delta")
 # --- INITIALISATION DE LA SESSION DATABRICKS ---
 @st.cache_resource
 def get_spark_session():
-    # Récupère automatiquement le contexte sécurisé de l'utilisateur/service principal de l'app
-    return DatabricksSession.builder.getOrCreate()
+    # .serverless() est nécessaire : sans cluster_id ni indication explicite,
+    # Databricks Connect ne déduit pas tout seul qu'il doit utiliser le compute serverless.
+    return DatabricksSession.builder.serverless().getOrCreate()
 
 
 spark = get_spark_session()
